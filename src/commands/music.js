@@ -95,9 +95,6 @@ module.exports = {
 
       const guildId = interaction.guild.id;
 
-      // 대기열에 추가
-      const position = addSong(guildId, songInfo);
-
       // 음성채널 연결
       await connectAndSetup(
         guildId,
@@ -106,10 +103,15 @@ module.exports = {
         interaction.guild.voiceAdapterCreator
       );
 
-      const queueInfo = getQueueInfo(guildId);
+      // 현재 재생 중인지 먼저 확인
+      const queueBefore = getQueueInfo(guildId);
+      const wasPlaying = queueBefore.playing && queueBefore.songs.length > 0;
 
-      if (!queueInfo.playing) {
-        // 재생 시작
+      // 대기열에 추가
+      const position = addSong(guildId, songInfo);
+
+      if (!wasPlaying) {
+        // 재생 중이 아닐 때만 새로 시작
         await playCurrentSong(guildId);
 
         const embed = new EmbedBuilder()

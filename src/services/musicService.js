@@ -1,19 +1,34 @@
-const {
-  joinVoiceChannel,
-  createAudioPlayer,
-  createAudioResource,
-  AudioPlayerStatus,
-  VoiceConnectionStatus,
-  entersState,
-  NoSubscriberBehavior,
-  StreamType,
-} = require('@discordjs/voice');
-const { spawn, execFile } = require('child_process');
-const { promisify } = require('util');
-const execFileAsync = promisify(execFile);
+/**
+ * Music Service - Lavalink + Shoukaku 기반
+ *
+ * 기존 yt-dlp + ffmpeg 조합을 Lavalink으로 대체.
+ * export 인터페이스는 기존과 동일하게 유지하여 commands/ 파일 수정 불필요.
+ */
 
 // 길드별 대기열 관리
 const queues = new Map();
+
+// Shoukaku 인스턴스 참조 (init에서 설정)
+let shoukaku = null;
+
+/**
+ * Shoukaku 인스턴스 설정 (index.js에서 호출)
+ */
+function init(shoukakuInstance) {
+  shoukaku = shoukakuInstance;
+}
+
+/**
+ * Lavalink 노드 가져오기
+ */
+function getNode() {
+  if (!shoukaku) throw new Error('사용 가능한 Lavalink 노드가 없습니다. (shoukaku 미초기화)');
+  for (const [name, node] of shoukaku.nodes) {
+    console.log(`[getNode] 노드: ${name}, state: ${node.state}`);
+    if (node.state === 1) return node;
+  }
+  throw new Error('사용 가능한 Lavalink 노드가 없습니다.');
+}
 
 /**
  * 대기열 가져오기 (없으면 생성)
@@ -22,7 +37,6 @@ function getQueue(guildId) {
   if (!queues.has(guildId)) {
     queues.set(guildId, {
       songs: [],
-      connection: null,
       player: null,
       textChannel: null,
       playing: false,
@@ -42,127 +56,100 @@ function addSong(guildId, song) {
 }
 
 /**
- * yt-dlp로 YouTube 검색 (여러 결과 반환)
- */
-async function ytdlpSearch(query, limit = 5) {
-  const { stdout } = await execFileAsync('yt-dlp', [
-    `ytsearch${limit}:${query}`,
-    '--dump-json',
-    '--no-download',
-    '--no-warnings',
-    '--flat-playlist',
-  ], { timeout: 15000 });
-
-  return stdout
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line));
-}
-
-/**
- * yt-dlp로 단일 영상 정보 가져오기
- */
-async function ytdlpGetInfo(url) {
-  const { stdout } = await execFileAsync('yt-dlp', [
-    url,
-    '--dump-json',
-    '--no-download',
-    '--no-warnings',
-  ], { timeout: 15000 });
-
-  return JSON.parse(stdout.trim());
-}
-
-/**
  * YouTube 검색 또는 URL에서 곡 정보 추출
- * - URL 직접 입력 지원
- * - MV 영상 우선 검색 (공식 뮤직비디오 우선)
- * - 자유로운 검색어 지원 (곡 제목만, 가사 일부, 별명 등)
  */
 async function searchAndGetInfo(query) {
-  // URL인지 확인
+  const node = getNode();
+
   const urlPattern = /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//;
+  let searchQuery;
+
   if (urlPattern.test(query)) {
-    const info = await ytdlpGetInfo(query);
-    return {
-      title: info.title,
-      url: info.webpage_url || info.url,
-      duration: formatDuration(info.duration),
-      durationSec: info.duration || 0,
-      thumbnail: info.thumbnail || null,
-      channel: info.channel || info.uploader || '알 수 없음',
-    };
+    try {
+      const urlObj = new URL(query.startsWith('http') ? query : `https://${query}`);
+      urlObj.searchParams.delete('list');
+      urlObj.searchParams.delete('start_radio');
+      urlObj.searchParams.delete('index');
+      searchQuery = urlObj.toString();
+    } catch {
+      searchQuery = query;
+    }
+  } else {
+    searchQuery = `ytsearch:${query}`;
   }
 
-  // MV 키워드가 이미 포함되어 있는지 확인
-  const mvKeywords = ['mv', 'music video', '뮤직비디오', 'official'];
-  const hasMvKeyword = mvKeywords.some((kw) => query.toLowerCase().includes(kw.toLowerCase()));
+  const result = await node.rest.resolve(searchQuery);
 
-  // MV 우선 검색
-  const searchQuery = hasMvKeyword ? query : `${query} MV`;
-  const results = await ytdlpSearch(searchQuery, 5);
-
-  if (!results || results.length === 0) {
-    // MV 검색 실패 시 원본 쿼리로 재시도
-    if (!hasMvKeyword) {
-      const fallback = await ytdlpSearch(query, 3);
-      if (!fallback || fallback.length === 0) return null;
-      return pickBestResult(fallback);
-    }
+  if (!result || result.loadType === 'empty' || result.loadType === 'error') {
     return null;
   }
 
-  return pickBestResult(results);
-}
+  let track;
 
-/**
- * 검색 결과에서 MV/공식 영상 우선 선택
- */
-function pickBestResult(results) {
-  // MV/공식 영상 우선 선택
-  const mvResult = results.find((v) => {
-    const title = (v.title || '').toLowerCase();
-    const channel = (v.channel || v.uploader || '').toLowerCase();
-    return (
-      title.includes('mv') ||
-      title.includes('m/v') ||
-      title.includes('music video') ||
-      title.includes('official') ||
-      title.includes('뮤직비디오') ||
-      channel.includes('official') ||
-      channel.includes('hybe') ||
-      channel.includes('sm entertainment') ||
-      channel.includes('jyp') ||
-      channel.includes('yg')
-    );
-  });
-
-  const video = mvResult || results[0];
-
-  // 라이브 영상이나 너무 긴 영상(1시간 이상) 제외
-  if (!video.duration || video.duration > 3600) {
-    const filtered = results.find((v) => v.duration > 0 && v.duration <= 3600);
-    if (filtered) return buildSongInfo(filtered);
-    // 전부 라이브/긴 영상이면 첫 번째 결과 사용
-    return buildSongInfo(results[0]);
+  switch (result.loadType) {
+    case 'track':
+      track = result.data;
+      break;
+    case 'search':
+      if (!result.data.length) return null;
+      track = pickBestTrack(result.data, query);
+      break;
+    case 'playlist':
+      if (!result.data.tracks.length) return null;
+      track = result.data.tracks[0];
+      break;
+    default:
+      return null;
   }
 
-  return buildSongInfo(video);
+  return {
+    title: track.info.title,
+    url: track.info.uri,
+    duration: formatDuration(Math.floor(track.info.length / 1000)),
+    durationSec: Math.floor(track.info.length / 1000),
+    thumbnail: track.info.artworkUrl || null,
+    channel: track.info.author || '알 수 없음',
+    encoded: track.encoded,
+  };
 }
 
 /**
- * 검색 결과에서 곡 정보 객체 생성
+ * 검색 결과에서 최적 트랙 선택
  */
-function buildSongInfo(video) {
-  return {
-    title: video.title,
-    url: video.webpage_url || video.url || `https://www.youtube.com/watch?v=${video.id}`,
-    duration: formatDuration(video.duration),
-    durationSec: video.duration || 0,
-    thumbnail: video.thumbnail || video.thumbnails?.[0]?.url || null,
-    channel: video.channel || video.uploader || '알 수 없음',
-  };
+function pickBestTrack(tracks, query) {
+  if (!query || tracks.length <= 1) return tracks[0];
+
+  const q = query.toLowerCase().replace(/[^\w\s가-힣]/g, '');
+  const qWords = q.split(/\s+/).filter((w) => w.length > 1);
+
+  if (qWords.length === 0) return tracks[0];
+
+  const valid = tracks.filter((t) => !t.info.isStream && t.info.length > 0 && t.info.length <= 3600000);
+  const candidates = valid.length > 0 ? valid : tracks;
+
+  let bestIdx = 0;
+  let bestScore = 0;
+
+  candidates.forEach((t, i) => {
+    const title = (t.info.title || '').toLowerCase().replace(/[^\w\s가-힣]/g, '');
+    const matchedWords = qWords.filter((w) => title.includes(w));
+    const score = matchedWords.length / qWords.length;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = i;
+    }
+  });
+
+  if (bestScore > 0.5 && bestIdx !== 0) {
+    const firstTitle = (candidates[0].info.title || '').toLowerCase().replace(/[^\w\s가-힣]/g, '');
+    const firstWords = qWords.filter((w) => firstTitle.includes(w));
+    const firstScore = firstWords.length / qWords.length;
+    if (bestScore > firstScore) {
+      return candidates[bestIdx];
+    }
+  }
+
+  return candidates[0];
 }
 
 /**
@@ -173,40 +160,35 @@ async function playCurrentSong(guildId) {
 
   if (queue.songs.length === 0) {
     queue.playing = false;
-    // 3분 후 자동 퇴장 타이머
     startDisconnectTimer(guildId);
     return;
   }
 
-  // 자동 퇴장 타이머 취소
   clearDisconnectTimer(guildId);
 
   const song = queue.songs[0];
   queue.playing = true;
 
   try {
-    // yt-dlp로 오디오 스트림 생성
-    const ytdlp = spawn('yt-dlp', [
-      '-f', 'bestaudio',
-      '-o', '-',
-      '--no-warnings',
-      '--quiet',
-      song.url,
-    ]);
+    if (!queue.player) {
+      throw new Error('Lavalink 플레이어가 없습니다.');
+    }
 
-    const resource = createAudioResource(ytdlp.stdout, {
-      inputType: StreamType.Arbitrary,
-    });
-
-    ytdlp.stderr.on('data', (data) => {
-      console.error('yt-dlp stderr:', data.toString());
-    });
-
-    queue.player.play(resource);
+    if (song.encoded) {
+      await queue.player.playTrack({ track: { encoded: song.encoded } });
+    } else {
+      const node = getNode();
+      const result = await node.rest.resolve(song.url);
+      if (!result || result.loadType === 'empty' || result.loadType === 'error') {
+        throw new Error('트랙을 로드할 수 없습니다.');
+      }
+      const track = result.loadType === 'track' ? result.data : result.data.tracks?.[0] || result.data[0];
+      if (!track) throw new Error('트랙을 찾을 수 없습니다.');
+      await queue.player.playTrack({ track: { encoded: track.encoded } });
+    }
   } catch (err) {
     console.error('음악 재생 오류:', err);
 
-    // 실패한 곡 제거 후 다음 곡 시도
     queue.songs.shift();
     if (queue.textChannel) {
       queue.textChannel.send(`❌ **${song.title}** 재생에 실패했습니다. 다음 곡으로 넘어갑니다.`).catch(() => {});
@@ -216,109 +198,104 @@ async function playCurrentSong(guildId) {
 }
 
 /**
- * 음성 채널 연결 + 플레이어 세팅
+ * 음성 채널 연결 + Shoukaku 플레이어 세팅
  */
 async function connectAndSetup(guildId, voiceChannel, textChannel, adapterCreator) {
   const queue = getQueue(guildId);
 
-  // 이미 연결되어 있으면 재사용
-  if (queue.connection && queue.player) {
+  if (queue.player) {
     queue.textChannel = textChannel;
     return;
   }
 
-  const connection = joinVoiceChannel({
+  const player = await shoukaku.joinVoiceChannel({
+    guildId: guildId,
     channelId: voiceChannel.id,
-    guildId,
-    adapterCreator,
+    shardId: 0,
+    deaf: true,
   });
 
-  try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
-  } catch (err) {
-    console.error('음성채널 연결 실패 상세:', err.message, '| 상태:', connection.state?.status);
-    connection.destroy();
-    throw new Error('음성채널 연결에 실패했습니다. 잠시 후 다시 시도해주세요.');
-  }
+  let endProcessing = false;
+  player.on('end', async (data) => {
+    if (data.reason === 'replaced' || data.reason === 'cleanup') return;
+    if (endProcessing) return;
+    endProcessing = true;
 
-  const player = createAudioPlayer({
-    behaviors: {
-      noSubscriber: NoSubscriberBehavior.Play,
-    },
-  });
-
-  // Idle 이벤트 → 다음 곡 자동 재생
-  player.on(AudioPlayerStatus.Idle, () => {
-    queue.songs.shift(); // 끝난 곡 제거
-    if (queue.songs.length > 0) {
-      playCurrentSong(guildId);
-      // 다음 곡 알림
-      const nextSong = queue.songs[0];
-      if (queue.textChannel) {
-        queue.textChannel.send(`🎵 **지금 재생:** ${nextSong.title} [${nextSong.duration}]`).catch(() => {});
-      }
-    } else {
-      queue.playing = false;
-      if (queue.textChannel) {
-        queue.textChannel.send('📭 대기열의 모든 곡을 재생했습니다. 3분 후 자동으로 퇴장합니다.').catch(() => {});
-      }
-      startDisconnectTimer(guildId);
-    }
-  });
-
-  player.on('error', (err) => {
-    console.error('오디오 플레이어 오류:', err.message);
-  });
-
-  // 연결 끊김 감지
-  connection.on(VoiceConnectionStatus.Disconnected, async () => {
     try {
-      await Promise.race([
-        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-      ]);
-      // 재연결 시도 중
-    } catch {
-      // 완전히 끊김 → 정리
-      cleanup(guildId);
+      const q = queues.get(guildId);
+      if (!q || q.player !== player) return; // 이미 정리된 큐면 무시
+
+      q.songs.shift();
+      if (q.songs.length > 0) {
+        const nextSong = q.songs[0];
+        if (q.textChannel) {
+          q.textChannel.send(`🎵 **지금 재생:** ${nextSong.title} [${nextSong.duration}]`).catch(() => {});
+        }
+        await playCurrentSong(guildId);
+      } else {
+        q.playing = false;
+        if (q.textChannel) {
+          q.textChannel.send('📭 대기열의 모든 곡을 재생했습니다. 3분 후 자동으로 퇴장합니다.').catch(() => {});
+        }
+        startDisconnectTimer(guildId);
+      }
+    } finally {
+      endProcessing = false;
     }
   });
 
-  connection.subscribe(player);
+  player.on('exception', (error) => {
+    console.error('Lavalink 플레이어 예외:', error);
+  });
 
-  queue.connection = connection;
+  player.on('closed', (data) => {
+    console.warn('Lavalink 플레이어 연결 끊김:', data);
+    // 4014 = 채널 이동 (moveOnDisconnect가 처리) → 무시
+    if (data.code === 4014) return;
+    const q = queues.get(guildId);
+    // 현재 플레이어와 일치할 때만 정리 (이미 stop()으로 정리된 큐면 무시)
+    if (q && q.player === player) {
+      q.player = null;
+      q.playing = false;
+    }
+  });
+
   queue.player = player;
   queue.textChannel = textChannel;
 }
 
 /**
- * 스킵 (현재 곡 건너뛰기)
+ * 스킵
  */
 function skip(guildId) {
   const queue = getQueue(guildId);
   if (!queue.player) return false;
-  // player.stop() → Idle 이벤트 트리거 → 다음 곡 자동 재생
-  queue.player.stop();
+  queue.player.stopTrack();
   return true;
 }
 
 /**
- * 정지 (대기열 비우기 + 연결 종료)
+ * 정지
  */
 function stop(guildId) {
-  const queue = getQueue(guildId);
+  const queue = queues.get(guildId);
+  if (!queue) return true;
+
+  const player = queue.player;
+  queue.player = null; // closed 이벤트에서 이 큐를 건드리지 않게 먼저 해제
   queue.songs = [];
   queue.playing = false;
   clearDisconnectTimer(guildId);
-
-  if (queue.player) {
-    queue.player.stop();
-  }
-  if (queue.connection) {
-    queue.connection.destroy();
-  }
-
   queues.delete(guildId);
+
+  if (player) {
+    try {
+      if (shoukaku) shoukaku.leaveVoiceChannel(guildId);
+    } catch (err) {
+      console.error('음성채널 퇴장 오류:', err);
+    }
+  }
+
   return true;
 }
 
@@ -328,7 +305,7 @@ function stop(guildId) {
 function pause(guildId) {
   const queue = getQueue(guildId);
   if (!queue.player) return false;
-  queue.player.pause();
+  queue.player.setPaused(true);
   return true;
 }
 
@@ -338,12 +315,12 @@ function pause(guildId) {
 function resume(guildId) {
   const queue = getQueue(guildId);
   if (!queue.player) return false;
-  queue.player.unpause();
+  queue.player.setPaused(false);
   return true;
 }
 
 /**
- * 대기열 정보 가져오기
+ * 대기열 정보
  */
 function getQueueInfo(guildId) {
   const queue = getQueue(guildId);
@@ -383,7 +360,7 @@ function clearDisconnectTimer(guildId) {
 }
 
 /**
- * 정리 (연결 끊김 시)
+ * 정리
  */
 function cleanup(guildId) {
   const queue = queues.get(guildId);
@@ -391,10 +368,9 @@ function cleanup(guildId) {
     queue.songs = [];
     queue.playing = false;
     clearDisconnectTimer(guildId);
-    if (queue.player) queue.player.stop();
-    if (queue.connection) {
-      try { queue.connection.destroy(); } catch {}
-    }
+    try {
+      if (shoukaku) shoukaku.leaveVoiceChannel(guildId);
+    } catch {}
     queues.delete(guildId);
   }
 }
@@ -415,6 +391,7 @@ function formatDuration(seconds) {
 }
 
 module.exports = {
+  init,
   getQueue,
   addSong,
   searchAndGetInfo,

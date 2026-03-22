@@ -1,4 +1,5 @@
 const { Client, GatewayIntentBits, Collection, Events, MessageFlags } = require('discord.js');
+const { Shoukaku, Connectors } = require('shoukaku');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
@@ -9,6 +10,38 @@ const client = new Client({
     GatewayIntentBits.GuildVoiceStates,
   ],
 });
+
+// ============================================
+// Shoukaku (Lavalink 클라이언트) 설정
+// ============================================
+const lavalinkNodes = [
+  {
+    name: 'home',
+    url: 'localhost:2333',
+    auth: 'musicbot_lavalink_pass',
+    secure: false,
+  },
+];
+
+const shoukaku = new Shoukaku(new Connectors.DiscordJS(client), lavalinkNodes, {
+  moveOnDisconnect: true,
+  resume: false,
+  reconnectTries: 5,
+  restTimeout: 60000,
+});
+
+shoukaku.on('ready', (name) => console.log(`🔗 [Lavalink] ${name} 노드 연결됨`));
+shoukaku.on('error', (name, error) => console.error(`❌ [Lavalink] ${name} 에러:`, error));
+shoukaku.on('close', (name, code, reason) => console.warn(`⚠️ [Lavalink] ${name} 연결 해제: ${code} - ${reason}`));
+shoukaku.on('disconnect', (name, players, moved) => {
+  console.warn(`⚠️ [Lavalink] ${name} 연결 끊김, 플레이어 ${players.size}개 영향`);
+});
+
+client.shoukaku = shoukaku;
+
+// musicService에 Shoukaku 인스턴스 전달
+const musicService = require('./services/musicService');
+musicService.init(shoukaku);
 
 // ============================================
 // 명령어 로드
@@ -51,7 +84,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
   try {
     await command.execute(interaction);
   } catch (error) {
-    // 10062: 만료된 인터랙션 (봇 재시작 중 사용된 커맨드), 40060: 이미 응답됨 → 무시
     if (error.code === 10062 || error.code === 40060) return;
 
     console.error(`명령어 실행 오류 (${interaction.commandName}):`, error);
