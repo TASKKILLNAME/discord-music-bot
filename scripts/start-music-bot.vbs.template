@@ -1,0 +1,19 @@
+' discord-music-bot 자동 시작 스크립트 (Windows)
+' 로그인 시 Lavalink + 음악봇을 조용히 실행 (CMD 창 없음)
+' 로그는 __PROJECT_DIR__\bot.log 에 기록됨
+
+Option Explicit
+Dim sh, botDir
+Set sh = CreateObject("WScript.Shell")
+botDir = "__PROJECT_DIR__"
+
+' 1) Lavalink 서버 시작 (javaw - 창 없음)
+sh.CurrentDirectory = botDir & "\lavalink"
+sh.Run "javaw -jar Lavalink.jar", 0, False
+
+' 2) Lavalink 초기화 대기 (25초)
+WScript.Sleep 25000
+
+' 3) 음악봇 시작 - stdout/stderr을 bot.log로 리디렉션, 창 숨김
+sh.CurrentDirectory = botDir
+sh.Run "cmd /c node src\index.js > """ & botDir & "\bot.log"" 2>&1", 0, False
