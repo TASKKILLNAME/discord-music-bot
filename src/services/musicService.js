@@ -208,6 +208,18 @@ async function connectAndSetup(guildId, voiceChannel, textChannel, adapterCreato
     return;
   }
 
+  // 기존 stale 연결이 있으면 먼저 정리
+  try {
+    const existing = shoukaku.connections.get(guildId);
+    if (existing) {
+      console.log(`[connectAndSetup] 기존 연결 정리: ${guildId}`);
+      shoukaku.leaveVoiceChannel(guildId);
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  } catch (e) {
+    console.warn('[connectAndSetup] stale 연결 정리 실패:', e.message);
+  }
+
   const player = await shoukaku.joinVoiceChannel({
     guildId: guildId,
     channelId: voiceChannel.id,
@@ -320,6 +332,17 @@ function resume(guildId) {
 }
 
 /**
+ * 대기열에서 특정 곡 제거 (index: 대기열 번호, 1부터 시작 = songs[1]부터)
+ * songs[0]은 현재 재생 중이므로 제거 대상 아님
+ */
+function removeSong(guildId, index) {
+  const queue = getQueue(guildId);
+  if (index < 1 || index >= queue.songs.length) return null;
+  const [removed] = queue.songs.splice(index, 1);
+  return removed;
+}
+
+/**
  * 대기열 정보
  */
 function getQueueInfo(guildId) {
@@ -394,6 +417,7 @@ module.exports = {
   init,
   getQueue,
   addSong,
+  removeSong,
   searchAndGetInfo,
   playCurrentSong,
   connectAndSetup,

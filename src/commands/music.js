@@ -1,6 +1,7 @@
 const { SlashCommandBuilder, EmbedBuilder, MessageFlags } = require('discord.js');
 const {
   addSong,
+  removeSong,
   searchAndGetInfo,
   playCurrentSong,
   connectAndSetup,
@@ -36,6 +37,18 @@ module.exports = {
       sub.setName('대기열').setDescription('현재 재생 대기열을 확인합니다')
     )
     .addSubcommand((sub) =>
+      sub
+        .setName('제거')
+        .setDescription('대기열에서 특정 곡을 제거합니다')
+        .addIntegerOption((opt) =>
+          opt
+            .setName('번호')
+            .setDescription('제거할 곡의 대기열 번호 (대기열에서 확인)')
+            .setRequired(true)
+            .setMinValue(1)
+        )
+    )
+    .addSubcommand((sub) =>
       sub.setName('일시정지').setDescription('음악을 일시정지합니다')
     )
     .addSubcommand((sub) =>
@@ -54,6 +67,8 @@ module.exports = {
         return this.handleSkip(interaction);
       case '대기열':
         return this.handleQueue(interaction);
+      case '제거':
+        return this.handleRemove(interaction);
       case '일시정지':
         return this.handlePause(interaction);
       case '다시재생':
@@ -103,15 +118,11 @@ module.exports = {
         interaction.guild.voiceAdapterCreator
       );
 
-      // 현재 재생 중인지 먼저 확인
-      const queueBefore = getQueueInfo(guildId);
-      const wasPlaying = queueBefore.playing && queueBefore.songs.length > 0;
-
       // 대기열에 추가
       const position = addSong(guildId, songInfo);
 
-      if (!wasPlaying) {
-        // 재생 중이 아닐 때만 새로 시작
+      if (position === 1) {
+        // 대기열의 첫 번째 곡일 때만 재생 시작
         await playCurrentSong(guildId);
 
         const embed = new EmbedBuilder()
@@ -219,6 +230,38 @@ module.exports = {
       .setColor(0x5865F2);
 
     await interaction.reply({ embeds: [embed] });
+  },
+
+  async handleRemove(interaction) {
+    const guildId = interaction.guild.id;
+    const index = interaction.options.getInteger('번호');
+    const queueInfo = getQueueInfo(guildId);
+
+    if (queueInfo.songs.length <= 1) {
+      return interaction.reply({
+        content: '📭 대기열에 제거할 곡이 없습니다.',
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+
+    if (index < 1 || index >= queueInfo.songs.length) {
+      return interaction.reply({
+        content: `❌ 유효한 번호를 입력해주세요. (1~${queueInfo.songs.length - 1})`,
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+
+    const removed = removeSong(guildId, index);
+    if (!removed) {
+      return interaction.reply({
+        content: '❌ 곡을 제거할 수 없습니다.',
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+
+    await interaction.reply({
+      content: `🗑️ 대기열 ${index}번 **${removed.title}**을(를) 제거했습니다.`,
+    });
   },
 
   async handlePause(interaction) {

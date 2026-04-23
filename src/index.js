@@ -28,6 +28,7 @@ const shoukaku = new Shoukaku(new Connectors.DiscordJS(client), lavalinkNodes, {
   resume: false,
   reconnectTries: 5,
   restTimeout: 60000,
+  voiceConnectionTimeout: 30000,
 });
 
 shoukaku.on('ready', (name) => console.log(`🔗 [Lavalink] ${name} 노드 연결됨`));

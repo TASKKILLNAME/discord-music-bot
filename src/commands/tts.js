@@ -3,19 +3,9 @@ const {
   EmbedBuilder,
   MessageFlags,
 } = require('discord.js');
-const {
-  joinVoiceChannel,
-  createAudioPlayer,
-  createAudioResource,
-  AudioPlayerStatus,
-  VoiceConnectionStatus,
-  entersState,
-} = require('@discordjs/voice');
 const { textToSpeech, splitText, cleanupTTSFiles } = require('../services/ttsService');
 const fs = require('fs');
-
-// 서버별 플레이어 관리
-const players = new Map();
+const path = require('path');
 
 module.exports = {
   data: new SlashCommandBuilder()
@@ -51,14 +41,6 @@ module.exports = {
     ),
 
   async execute(interaction) {
-    // 클라우드 환경(Railway 등)에서는 UDP를 지원하지 않아 음성채널 사용 불가
-    if (process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID) {
-      return interaction.reply({
-        content: '⚠️ 현재 클라우드 환경에서 운영 중이라 TTS(음성채널) 기능을 사용할 수 없습니다.\n> 클라우드 서비스(Railway)는 UDP 연결을 지원하지 않아 음성채널 접속이 불가합니다.',
-        flags: MessageFlags.Ephemeral,
-      });
-    }
-
     const subcommand = interaction.options.getSubcommand();
 
     switch (subcommand) {
@@ -73,7 +55,6 @@ module.exports = {
     const text = interaction.options.getString('텍스트');
     const lang = interaction.options.getString('언어') || 'ko';
 
-    // 사용자가 음성채널에 있는지 확인
     const voiceChannel = interaction.member.voice.channel;
     if (!voiceChannel) {
       return interaction.reply({
@@ -82,7 +63,6 @@ module.exports = {
       });
     }
 
-    // 봇 권한 확인
     const permissions = voiceChannel.permissionsFor(interaction.guild.members.me);
     if (!permissions.has('Connect') || !permissions.has('Speak')) {
       return interaction.reply({
@@ -92,6 +72,11 @@ module.exports = {
     }
 
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    const shoukaku = interaction.client.shoukaku;
+    if (!shoukaku) {
+      return interaction.editReply({ content: '❌ Lavalink이 초기화되지 않았습니다.' });
+    }
 
     try {
       // TTS 파일 생성
@@ -103,53 +88,92 @@ module.exports = {
         audioFiles.push(filePath);
       }
 
-      // 음성채널 접속
-      const connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId: interaction.guild.id,
-        adapterCreator: interaction.guild.voiceAdapterCreator,
-      });
+      const guildId = interaction.guild.id;
 
-      // 연결 대기
-      try {
-        await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
-      } catch {
-        connection.destroy();
-        return interaction.editReply({
-          content: '❌ 음성채널 연결에 실패했습니다.',
+      // Shoukaku로 음성채널 연결 (이미 연결되어 있으면 기존 플레이어 사용)
+      let player = shoukaku.players.get(guildId);
+      if (!player) {
+        player = await shoukaku.joinVoiceChannel({
+          guildId,
+          channelId: voiceChannel.id,
+          shardId: 0,
+          deaf: true,
         });
       }
 
-      // 오디오 플레이어 생성
-      const player = createAudioPlayer();
-      connection.subscribe(player);
-      players.set(interaction.guild.id, { player, connection });
+      // 노드에서 로컬 파일 resolve
+      let node = null;
+      for (const [, n] of shoukaku.nodes) {
+        if (n.state === 1) { node = n; break; }
+      }
+      if (!node) {
+        cleanupFiles(audioFiles);
+        return interaction.editReply({ content: '❌ 사용 가능한 Lavalink 노드가 없습니다.' });
+      }
 
       // 순차 재생
       let fileIndex = 0;
 
-      const playNext = () => {
+      const playNext = async () => {
         if (fileIndex >= audioFiles.length) {
-          // 모든 파일 재생 완료 → 정리
           cleanupFiles(audioFiles);
           cleanupTTSFiles();
           return;
         }
 
-        const resource = createAudioResource(audioFiles[fileIndex]);
-        player.play(resource);
+        const absPath = path.resolve(audioFiles[fileIndex]);
         fileIndex++;
+
+        const result = await node.rest.resolve(absPath);
+        if (!result || result.loadType === 'empty' || result.loadType === 'error') {
+          console.error('TTS 트랙 로드 실패:', absPath);
+          return playNext();
+        }
+
+        const track = result.loadType === 'track' ? result.data : result.data?.tracks?.[0];
+        if (!track) {
+          return playNext();
+        }
+
+        await player.playTrack({ track: { encoded: track.encoded } });
       };
 
-      player.on(AudioPlayerStatus.Idle, playNext);
+      // end 이벤트로 다음 파일 재생
+      const onEnd = async (data) => {
+        if (data.reason === 'replaced' || data.reason === 'cleanup') return;
+        player.off('end', onEnd);
+        await playNext();
+      };
 
-      player.on('error', (err) => {
-        console.error('오디오 재생 오류:', err.message);
-        cleanupFiles(audioFiles);
-      });
+      // 재생 시작 전에 리스너 등록
+      const startPlay = async () => {
+        if (fileIndex >= audioFiles.length) {
+          cleanupFiles(audioFiles);
+          cleanupTTSFiles();
+          return;
+        }
 
-      // 첫 번째 파일 재생
-      playNext();
+        const absPath = path.resolve(audioFiles[fileIndex]);
+        fileIndex++;
+
+        const result = await node.rest.resolve(absPath);
+        if (!result || result.loadType === 'empty' || result.loadType === 'error') {
+          console.error('TTS 트랙 로드 실패:', absPath);
+          cleanupFiles(audioFiles);
+          return interaction.editReply({ content: '❌ TTS 오디오를 재생할 수 없습니다.' });
+        }
+
+        const track = result.loadType === 'track' ? result.data : result.data?.tracks?.[0];
+        if (!track) {
+          cleanupFiles(audioFiles);
+          return interaction.editReply({ content: '❌ TTS 트랙을 찾을 수 없습니다.' });
+        }
+
+        player.on('end', onEnd);
+        await player.playTrack({ track: { encoded: track.encoded } });
+      };
+
+      await startPlay();
 
       const langNames = { ko: '한국어', en: '영어', ja: '일본어', 'zh-CN': '중국어' };
 
@@ -173,12 +197,12 @@ module.exports = {
   },
 
   async leave(interaction) {
-    const guildData = players.get(interaction.guild.id);
+    const shoukaku = interaction.client.shoukaku;
+    const guildId = interaction.guild.id;
+    const player = shoukaku?.players?.get(guildId);
 
-    if (guildData) {
-      guildData.player.stop();
-      guildData.connection.destroy();
-      players.delete(interaction.guild.id);
+    if (player) {
+      shoukaku.leaveVoiceChannel(guildId);
 
       await interaction.reply({
         content: '👋 음성채널에서 나갔습니다.',
